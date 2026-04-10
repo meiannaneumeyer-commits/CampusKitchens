@@ -9,7 +9,7 @@ st.set_page_config(
 )
 
 def get_connection():
-    return psycopg2.connect(st.secrets["DB_URL"])
+    return psycopg2.connect(st.secrets["DATABASE_URL"])
 
 st.title("🍽️ Food Entry Database App")
 st.write("Welcome! Use the sidebar to view, add, edit, or delete food entries.")
