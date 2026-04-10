@@ -1,19 +1,15 @@
-
 import streamlit as st
 import psycopg2
 
 st.set_page_config(page_title="Add Entry", page_icon="➕")
 
 def get_connection():
-    return psycopg2.connect(st.secrets["DATABASE_URL
-"])
+    return psycopg2.connect(st.secrets["DATABASE_URL"])
 
 st.title("➕ Add Food Entry")
-st.write("Enter a date and location, then type food items manually.")
+st.write("Enter one date and location, then type food items manually.")
 
-# --------------------------
-# Load locations only
-# --------------------------
+# Load locations
 try:
     conn = get_connection()
     cur = conn.cursor()
@@ -29,9 +25,10 @@ except Exception as e:
     st.error(f"Error loading locations: {e}")
     st.stop()
 
-# --------------------------
-# Form
-# --------------------------
+if not location_options:
+    st.error("No locations found in the database.")
+    st.stop()
+
 with st.form("add_entry_form"):
     entry_date = st.date_input("Entry Date")
     selected_location = st.selectbox("Location", options=list(location_options.keys()))
@@ -39,8 +36,13 @@ with st.form("add_entry_form"):
 
     st.markdown("### Add Food Items")
 
-    # Let user choose how many rows
-    num_items = st.number_input("Number of different items", min_value=1, max_value=10, value=3)
+    num_items = st.number_input(
+        "Number of different items",
+        min_value=1,
+        max_value=10,
+        value=3,
+        step=1
+    )
 
     item_inputs = []
 
@@ -59,24 +61,20 @@ with st.form("add_entry_form"):
 
     submitted = st.form_submit_button("Add Entry")
 
-# --------------------------
-# Submit logic
-# --------------------------
 if submitted:
     errors = []
-
-    # Validate
     valid_items = []
 
     for name, qty in item_inputs:
-        if name.strip() != "":
+        clean_name = name.strip()
+        if clean_name != "":
             if qty <= 0:
-                errors.append(f"Quantity for '{name}' must be > 0")
+                errors.append(f"Quantity for '{clean_name}' must be greater than 0.")
             else:
-                valid_items.append((name.strip(), qty))
+                valid_items.append((clean_name, qty))
 
     if len(valid_items) == 0:
-        errors.append("Enter at least one valid food item")
+        errors.append("Enter at least one food item.")
 
     if errors:
         for error in errors:
@@ -88,12 +86,10 @@ if submitted:
 
             location_id = location_options[selected_location]
 
-            # --------------------------
-            # 1. Get or create parent entry
-            # --------------------------
+            # Check for existing parent entry
             cur.execute(
                 """
-                SELECT id
+                SELECT id, notes
                 FROM food_entries
                 WHERE entry_date = %s AND location_id = %s;
                 """,
@@ -103,6 +99,17 @@ if submitted:
 
             if existing_entry:
                 entry_id = existing_entry[0]
+                existing_notes = existing_entry[1]
+
+                if notes and (existing_notes is None or str(existing_notes).strip() == ""):
+                    cur.execute(
+                        """
+                        UPDATE food_entries
+                        SET notes = %s
+                        WHERE id = %s;
+                        """,
+                        (notes, entry_id)
+                    )
             else:
                 cur.execute(
                     """
@@ -114,22 +121,21 @@ if submitted:
                 )
                 entry_id = cur.fetchone()[0]
 
-            # --------------------------
-            # 2. Insert items
-            # --------------------------
+            # Add typed food items
             for item_name, quantity in valid_items:
-
-                # Check if item exists
                 cur.execute(
-                    "SELECT id FROM food_items WHERE LOWER(name) = LOWER(%s);",
+                    """
+                    SELECT id
+                    FROM food_items
+                    WHERE LOWER(name) = LOWER(%s);
+                    """,
                     (item_name,)
                 )
-                result = cur.fetchone()
+                existing_food = cur.fetchone()
 
-                if result:
-                    food_item_id = result[0]
+                if existing_food:
+                    food_item_id = existing_food[0]
                 else:
-                    # Create new item
                     cur.execute(
                         """
                         INSERT INTO food_items (name)
@@ -140,7 +146,6 @@ if submitted:
                     )
                     food_item_id = cur.fetchone()[0]
 
-                # Check if already exists in this entry
                 cur.execute(
                     """
                     SELECT id, quantity
@@ -152,7 +157,9 @@ if submitted:
                 existing_item = cur.fetchone()
 
                 if existing_item:
-                    new_qty = float(existing_item[1]) + float(quantity)
+                    entry_item_id = existing_item[0]
+                    existing_quantity = float(existing_item[1])
+                    new_quantity = existing_quantity + float(quantity)
 
                     cur.execute(
                         """
@@ -160,7 +167,7 @@ if submitted:
                         SET quantity = %s
                         WHERE id = %s;
                         """,
-                        (new_qty, existing_item[0])
+                        (new_quantity, entry_item_id)
                     )
                 else:
                     cur.execute(
@@ -175,7 +182,7 @@ if submitted:
             cur.close()
             conn.close()
 
-            st.success("✅ Entry added successfully with typed items!")
+            st.success("✅ Food entry added successfully!")
 
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Error saving entry: {e}")
