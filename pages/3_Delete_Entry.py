@@ -1,126 +1,148 @@
 import streamlit as st
 import psycopg2
+import pandas as pd
 
-st.set_page_config(page_title="Edit Entry", page_icon="✏️")
+st.set_page_config(page_title="Delete Entry", page_icon="🗑️")
 
 def get_connection():
     return psycopg2.connect(st.secrets["DATABASE_URL"])
 
-st.title("✏️ Edit Food Entry")
+st.title("🗑️ Delete Food Entry")
+st.write("Search for a record, then delete it.")
 
 try:
     conn = get_connection()
     cur = conn.cursor()
 
+    # Load locations for optional filter
+    cur.execute("SELECT name FROM locations ORDER BY name;")
+    location_options = ["All"] + [row[0] for row in cur.fetchall()]
+
+    # Load years for optional filter
     cur.execute("""
+        SELECT DISTINCT EXTRACT(YEAR FROM entry_date)::INT AS year
+        FROM food_entries
+        ORDER BY year DESC;
+    """)
+    year_options = ["All"] + [str(row[0]) for row in cur.fetchall()]
+
+    cur.close()
+    conn.close()
+
+except Exception as e:
+    st.error(f"Error loading filters: {e}")
+    st.stop()
+
+col1, col2 = st.columns(2)
+selected_year = col1.selectbox("Filter by Year", year_options)
+selected_location = col2.selectbox("Filter by Location", location_options)
+
+item_search = st.text_input("Type food item name to search")
+
+try:
+    conn = get_connection()
+
+    query = """
         SELECT
-            ei.id,
+            ei.id AS entry_item_id,
+            fe.id AS food_entry_id,
             fe.entry_date,
-            l.name,
-            fi.name,
+            l.name AS location,
+            fi.name AS item,
             ei.quantity,
-            fe.notes,
-            fe.id
+            fe.notes
         FROM entry_items ei
         JOIN food_entries fe ON ei.entry_id = fe.id
         JOIN locations l ON fe.location_id = l.id
         JOIN food_items fi ON ei.food_item_id = fi.id
-        ORDER BY fe.entry_date DESC, ei.id DESC;
-    """)
-    records = cur.fetchall()
+        WHERE 1=1
+    """
+    params = []
 
-    cur.execute("SELECT id, name FROM locations ORDER BY name;")
-    location_rows = cur.fetchall()
-    location_options = {row[1]: row[0] for row in location_rows}
+    if selected_year != "All":
+        query += " AND EXTRACT(YEAR FROM fe.entry_date) = %s"
+        params.append(int(selected_year))
 
-    cur.execute("SELECT id, name FROM food_items ORDER BY name;")
-    item_rows = cur.fetchall()
-    item_options = {row[1]: row[0] for row in item_rows}
+    if selected_location != "All":
+        query += " AND l.name = %s"
+        params.append(selected_location)
 
-    cur.close()
+    if item_search.strip() != "":
+        query += " AND LOWER(fi.name) LIKE LOWER(%s)"
+        params.append(f"%{item_search.strip()}%")
+
+    query += " ORDER BY fe.entry_date DESC, l.name, fi.name;"
+
+    df = pd.read_sql(query, conn, params=params)
     conn.close()
 
 except Exception as e:
     st.error(f"Error loading records: {e}")
     st.stop()
 
-if not records:
-    st.info("No records available to edit.")
-    st.stop()
+if df.empty:
+    st.info("No matching records found.")
+else:
+    st.markdown("### Matching Records")
 
-record_map = {
-    f"{r[1]} | {r[2]} | {r[3]} | Qty: {r[4]}": r
-    for r in records
-}
+    for _, row in df.iterrows():
+        with st.container():
+            st.write(
+                f"**Date:** {row['entry_date']}  |  "
+                f"**Location:** {row['location']}  |  "
+                f"**Item:** {row['item']}  |  "
+                f"**Qty:** {row['quantity']}"
+            )
 
-selected_label = st.selectbox("Select a record to edit", list(record_map.keys()))
-selected_record = record_map[selected_label]
+            if pd.notna(row["notes"]) and str(row["notes"]).strip() != "":
+                st.write(f"**Notes:** {row['notes']}")
 
-entry_item_id = selected_record[0]
-current_date = selected_record[1]
-current_location_name = selected_record[2]
-current_item_name = selected_record[3]
-current_quantity = float(selected_record[4])
-current_notes = selected_record[5]
-food_entry_id = selected_record[6]
+            confirm_key = f"confirm_{int(row['entry_item_id'])}"
+            button_key = f"delete_{int(row['entry_item_id'])}"
 
-with st.form("edit_entry_form"):
-    new_date = st.date_input("Entry Date", value=current_date)
-    new_location = st.selectbox(
-        "Location",
-        options=list(location_options.keys()),
-        index=list(location_options.keys()).index(current_location_name)
-    )
-    new_item = st.selectbox(
-        "Food Item",
-        options=list(item_options.keys()),
-        index=list(item_options.keys()).index(current_item_name)
-    )
-    new_quantity = st.number_input("Quantity", min_value=0.01, value=current_quantity, step=0.5)
-    new_notes = st.text_area("Notes", value=current_notes if current_notes else "")
+            confirm = st.checkbox(
+                f"Confirm delete for {row['item']} on {row['entry_date']}",
+                key=confirm_key
+            )
 
-    submitted = st.form_submit_button("Update Entry")
+            if st.button("Delete This Record", key=button_key):
+                if not confirm:
+                    st.error("Please confirm deletion first.")
+                else:
+                    try:
+                        conn = get_connection()
+                        cur = conn.cursor()
 
-    if submitted:
-        errors = []
+                        entry_item_id = int(row["entry_item_id"])
+                        food_entry_id = int(row["food_entry_id"])
 
-        if new_quantity <= 0:
-            errors.append("Quantity must be greater than 0.")
+                        # Delete child row
+                        cur.execute(
+                            "DELETE FROM entry_items WHERE id = %s;",
+                            (entry_item_id,)
+                        )
 
-        if errors:
-            for error in errors:
-                st.error(error)
-        else:
-            try:
-                conn = get_connection()
-                cur = conn.cursor()
+                        # If no more child rows remain, delete parent row
+                        cur.execute(
+                            "SELECT COUNT(*) FROM entry_items WHERE entry_id = %s;",
+                            (food_entry_id,)
+                        )
+                        remaining = cur.fetchone()[0]
 
-                cur.execute(
-                    """
-                    UPDATE food_entries
-                    SET entry_date = %s,
-                        location_id = %s,
-                        notes = %s
-                    WHERE id = %s;
-                    """,
-                    (new_date, location_options[new_location], new_notes, food_entry_id)
-                )
+                        if remaining == 0:
+                            cur.execute(
+                                "DELETE FROM food_entries WHERE id = %s;",
+                                (food_entry_id,)
+                            )
 
-                cur.execute(
-                    """
-                    UPDATE entry_items
-                    SET food_item_id = %s,
-                        quantity = %s
-                    WHERE id = %s;
-                    """,
-                    (item_options[new_item], new_quantity, entry_item_id)
-                )
+                        conn.commit()
+                        cur.close()
+                        conn.close()
 
-                conn.commit()
-                cur.close()
-                conn.close()
+                        st.success("✅ Record deleted successfully!")
+                        st.rerun()
 
-                st.success("✅ Entry updated successfully!")
+                    except Exception as e:
+                        st.error(f"Error deleting record: {e}")
 
-            except Exception as e:
-                st.error(f"Error updating entry: {e}")
+            st.markdown("---")
