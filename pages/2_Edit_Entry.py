@@ -1,33 +1,18 @@
 import streamlit as st
 import psycopg2
 
-st.set_page_config(page_title="Edit Entry", page_icon="✏️")
+st.set_page_config(page_title="Add Entry", page_icon="➕")
 
 def get_connection():
-    return psycopg2.connect(st.secrets["DB_URL"])
+    return psycopg2.connect(st.secrets["DATABASE_URL"])
 
-st.title("✏️ Edit Food Entry")
+st.title("➕ Add Food Entry")
+st.write("Create one entry for a date and location, then attach multiple food items.")
 
+# Load dropdown data
 try:
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute("""
-        SELECT
-            ei.id,
-            fe.entry_date,
-            l.name,
-            fi.name,
-            ei.quantity,
-            fe.notes,
-            fe.id
-        FROM entry_items ei
-        JOIN food_entries fe ON ei.entry_id = fe.id
-        JOIN locations l ON fe.location_id = l.id
-        JOIN food_items fi ON ei.food_item_id = fi.id
-        ORDER BY fe.entry_date DESC, ei.id DESC;
-    """)
-    records = cur.fetchall()
 
     cur.execute("SELECT id, name FROM locations ORDER BY name;")
     location_rows = cur.fetchall()
@@ -41,86 +26,143 @@ try:
     conn.close()
 
 except Exception as e:
-    st.error(f"Error loading records: {e}")
+    st.error(f"Error loading form data: {e}")
     st.stop()
 
-if not records:
-    st.info("No records available to edit.")
+if not location_options:
+    st.error("No locations found in the database.")
     st.stop()
 
-record_map = {
-    f"{r[1]} | {r[2]} | {r[3]} | Qty: {r[4]}": r
-    for r in records
-}
+if not item_options:
+    st.error("No food items found in the database.")
+    st.stop()
 
-selected_label = st.selectbox("Select a record to edit", list(record_map.keys()))
-selected_record = record_map[selected_label]
+with st.form("multi_item_entry_form"):
+    entry_date = st.date_input("Entry Date")
+    selected_location = st.selectbox("Location", options=list(location_options.keys()))
+    notes = st.text_area("Notes")
 
-entry_item_id = selected_record[0]
-current_date = selected_record[1]
-current_location_name = selected_record[2]
-current_item_name = selected_record[3]
-current_quantity = float(selected_record[4])
-current_notes = selected_record[5]
-food_entry_id = selected_record[6]
-
-with st.form("edit_entry_form"):
-    new_date = st.date_input("Entry Date", value=current_date)
-    new_location = st.selectbox(
-        "Location",
-        options=list(location_options.keys()),
-        index=list(location_options.keys()).index(current_location_name)
+    st.markdown("### Select Food Items")
+    selected_items = st.multiselect(
+        "Choose one or more food items",
+        options=list(item_options.keys())
     )
-    new_item = st.selectbox(
-        "Food Item",
-        options=list(item_options.keys()),
-        index=list(item_options.keys()).index(current_item_name)
-    )
-    new_quantity = st.number_input("Quantity", min_value=0.01, value=current_quantity, step=0.5)
-    new_notes = st.text_area("Notes", value=current_notes if current_notes else "")
 
-    submitted = st.form_submit_button("Update Entry")
+    quantities = {}
+    if selected_items:
+        st.markdown("### Enter Quantity for Each Selected Item")
+        for item_name in selected_items:
+            quantities[item_name] = st.number_input(
+                f"Quantity for {item_name}",
+                min_value=0.01,
+                step=0.5,
+                key=f"qty_{item_name}"
+            )
 
-    if submitted:
-        errors = []
+    submitted = st.form_submit_button("Add Entry")
 
-        if new_quantity <= 0:
-            errors.append("Quantity must be greater than 0.")
+if submitted:
+    errors = []
 
-        if errors:
-            for error in errors:
-                st.error(error)
-        else:
-            try:
-                conn = get_connection()
-                cur = conn.cursor()
+    if len(selected_items) == 0:
+        errors.append("Please select at least one food item.")
 
+    for item_name in selected_items:
+        if quantities[item_name] <= 0:
+            errors.append(f"Quantity for {item_name} must be greater than 0.")
+
+    if errors:
+        for error in errors:
+            st.error(error)
+    else:
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+
+            location_id = location_options[selected_location]
+
+            # 1. Check whether a parent entry already exists for this date + location
+            cur.execute(
+                """
+                SELECT id, notes
+                FROM food_entries
+                WHERE entry_date = %s AND location_id = %s;
+                """,
+                (entry_date, location_id)
+            )
+            existing_entry = cur.fetchone()
+
+            if existing_entry:
+                entry_id = existing_entry[0]
+                existing_notes = existing_entry[1]
+
+                # Optional: update notes only if the existing notes are blank and user entered new notes
+                if notes and (existing_notes is None or str(existing_notes).strip() == ""):
+                    cur.execute(
+                        """
+                        UPDATE food_entries
+                        SET notes = %s
+                        WHERE id = %s;
+                        """,
+                        (notes, entry_id)
+                    )
+            else:
+                # 2. Create a new parent entry if one does not already exist
                 cur.execute(
                     """
-                    UPDATE food_entries
-                    SET entry_date = %s,
-                        location_id = %s,
-                        notes = %s
-                    WHERE id = %s;
+                    INSERT INTO food_entries (entry_date, location_id, notes)
+                    VALUES (%s, %s, %s)
+                    RETURNING id;
                     """,
-                    (new_date, location_options[new_location], new_notes, food_entry_id)
+                    (entry_date, location_id, notes)
                 )
+                entry_id = cur.fetchone()[0]
 
+            # 3. Insert or update each selected item
+            for item_name in selected_items:
+                food_item_id = item_options[item_name]
+                quantity = quantities[item_name]
+
+                # Check if this item already exists for the same parent entry
                 cur.execute(
                     """
-                    UPDATE entry_items
-                    SET food_item_id = %s,
-                        quantity = %s
-                    WHERE id = %s;
+                    SELECT id, quantity
+                    FROM entry_items
+                    WHERE entry_id = %s AND food_item_id = %s;
                     """,
-                    (item_options[new_item], new_quantity, entry_item_id)
+                    (entry_id, food_item_id)
                 )
+                existing_item = cur.fetchone()
 
-                conn.commit()
-                cur.close()
-                conn.close()
+                if existing_item:
+                    entry_item_id = existing_item[0]
+                    existing_quantity = float(existing_item[1])
 
-                st.success("✅ Entry updated successfully!")
+                    # Add the new quantity onto the old quantity
+                    new_quantity = existing_quantity + float(quantity)
 
-            except Exception as e:
-                st.error(f"Error updating entry: {e}")
+                    cur.execute(
+                        """
+                        UPDATE entry_items
+                        SET quantity = %s
+                        WHERE id = %s;
+                        """,
+                        (new_quantity, entry_item_id)
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO entry_items (entry_id, food_item_id, quantity)
+                        VALUES (%s, %s, %s);
+                        """,
+                        (entry_id, food_item_id, quantity)
+                    )
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            st.success("✅ Food entry added successfully!")
+
+        except Exception as e:
+            st.error(f"Error adding entry: {e}")
